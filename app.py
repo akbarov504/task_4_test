@@ -1,29 +1,26 @@
-import requests
 import time
-import math
-from threading import Lock, Thread
+import requests, uuid
+from threading import Thread, Lock
 from datetime import datetime, timezone
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
+from token_manager import get_valid_token
 
 app = Flask(__name__)
 
 SOURCE_CAN_API_URL = "http://127.0.0.1:8080/api/telemetry"
 GPS_API_URL = "http://127.0.0.1:5000/api/gps/info"
 
-POLL_INTERVAL_SECONDS = 3
+POLL_INTERVAL_SECONDS = 2
 SPEED_THRESHOLD_MPH = 5.0
-
-# TEST UCHUN PASAYTIRILGAN
-DEFAULT_SETTINGS = {
-    "movement_validation_duration": 3,   # oldin 10 edi
-    "stop_duration_threshold": 5,        # oldin 20 edi
-    "idle_time_limit": 10,               # oldin 60 edi
-}
-
+IDLE_TIME_LIMIT = 10
 
 def utc_now():
     return datetime.now(timezone.utc)
 
+def ts_to_iso(dt):
+    if not dt:
+        return None
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def parse_ts(value):
     if value is None:
@@ -36,16 +33,12 @@ def parse_ts(value):
         value = value.strip()
         if value.endswith("Z"):
             value = value[:-1] + "+00:00"
-        return datetime.fromisoformat(value)
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return utc_now()
 
-    raise ValueError("Invalid timestamp")
-
-
-def ts_to_iso(dt):
-    if not dt:
-        return None
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
+    return utc_now()
 
 def safe_float(value, default=0.0):
     try:
@@ -55,26 +48,13 @@ def safe_float(value, default=0.0):
     except Exception:
         return default
 
-
-def haversine_miles(lat1, lon1, lat2, lon2):
-    if None in [lat1, lon1, lat2, lon2]:
-        return 0.0
-
-    r = 3958.7613
-    phi1 = math.radians(float(lat1))
-    phi2 = math.radians(float(lat2))
-    dphi = math.radians(float(lat2) - float(lat1))
-    dlambda = math.radians(float(lon2) - float(lon1))
-
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
 def fetch_json(url, timeout=10):
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
+    try:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return {}
 
 def extract_gps_fields(gps_data):
     if not isinstance(gps_data, dict):
@@ -92,8 +72,8 @@ def extract_gps_fields(gps_data):
         or 0.0
     )
 
-    lat = gps_data.get("lat", gps_data.get("latitude"))
-    lon = gps_data.get("lon", gps_data.get("longitude"))
+    lat = gps_data.get("lat", gps_data.get("latitude", 0))
+    lon = gps_data.get("lon", gps_data.get("longitude", 0))
 
     return {
         "speed_mph": safe_float(speed_mph, 0.0),
@@ -101,8 +81,7 @@ def extract_gps_fields(gps_data):
         "lon": lon,
     }
 
-
-def fetch_source_can_data():
+def fetch_combined_data():
     telemetry_data = fetch_json(SOURCE_CAN_API_URL, timeout=10)
     gps_data = fetch_json(GPS_API_URL, timeout=10)
 
@@ -113,551 +92,170 @@ def fetch_source_can_data():
         return None
 
     gps_fields = extract_gps_fields(gps_data)
+    item = dict(telemetry_data)
+    item["speed_mph"] = gps_fields["speed_mph"]
+    item["lat"] = gps_fields["lat"]
+    item["lon"] = gps_fields["lon"]
 
-    combined = dict(telemetry_data)
-    combined["speed_mph"] = gps_fields["speed_mph"]
-    combined["lat"] = gps_fields["lat"]
-    combined["lon"] = gps_fields["lon"]
+    return item
 
-    return combined
-
-
-class SingleTruckProcessor:
+class SimpleEventDetector:
     def __init__(self):
         self.lock = Lock()
-        self.events = []
-        self.last_poll_status = {
-            "success": None,
-            "last_poll_time": None,
-            "last_error": None,
-            "item_received": False,
+
+        self.asset_state = "STOPPED"
+        self.last_event = {
+            "event_type": "STOPPED",
+            "timestamp": None,
+            "speed_mph": 0.0,
+            "engine_status": "OFF",
+            "lat": None,
+            "lon": None,
+            "current_odometer": None,
+            "message": "Initial state"
         }
 
-        self.state = {
-            "asset_state": "STATIONARY",
-            "settings": DEFAULT_SETTINGS.copy(),
+        self.last_data = None
+        self.idle_start_time = None
 
-            "last_timestamp": None,
-            "last_speed_mph": 0.0,
-            "last_latitude": None,
-            "last_longitude": None,
-            "last_odometer": None,
-            "last_engine_status": "OFF",
-
-            "last_processed_timestamp": None,
-
-            "move_candidate_start_time": None,
-            "move_candidate_latitude": None,
-            "move_candidate_longitude": None,
-            "move_candidate_odometer": None,
-
-            "stop_candidate_start_time": None,
-            "stop_candidate_latitude": None,
-            "stop_candidate_longitude": None,
-            "stop_candidate_odometer": None,
-
-            "trip_start_time": None,
-            "trip_start_latitude": None,
-            "trip_start_longitude": None,
-            "trip_start_odometer": None,
-
-            "idle_candidate_start_time": None,
-            "idle_candidate_latitude": None,
-            "idle_candidate_longitude": None,
-            "idle_active": False,
-
-            "total_idle_seconds": 0
-        }
-
-    def add_event(self, event):
-        self.events.append(event)
-        if len(self.events) > 10000:
-            self.events = self.events[-10000:]
-
-    def log(self, title, data=None):
-        print(f"[DEBUG] {title}")
-        if data is not None:
-            print(data)
-
-    def calculate_trip_distance(self, stop_odometer, stop_latitude, stop_longitude):
-        start_odometer = self.state.get("trip_start_odometer")
-
-        if start_odometer is not None and stop_odometer is not None:
-            diff = safe_float(stop_odometer) - safe_float(start_odometer)
-            return round(max(diff, 0.0), 3)
-
-        return round(
-            haversine_miles(
-                self.state.get("trip_start_latitude"),
-                self.state.get("trip_start_longitude"),
-                stop_latitude,
-                stop_longitude,
-            ),
-            3
-        )
-
-    def process_item(self, item):
+    def process(self, item):
         with self.lock:
-            print("\n==================================================")
-            print("[PROCESS_ITEM] NEW DATA")
-            print("RAW ITEM:", item)
-
             timestamp = parse_ts(item.get("timestamp"))
-            speed_mph = safe_float(item.get("speed_mph", 0))
-            latitude = item.get("lat")
-            longitude = item.get("lon")
-            current_odometer = item.get("current_odometer")
-            engine_status = str(item.get("engine_status", "OFF")).upper()
+            speed_mph = safe_float(item.get("speed_mph"), 0.0)
+            lat = item.get("lat")
+            lon = item.get("lon")
+            current_odometer = item.get("total_distance")
+            engine_status = str(item.get("status", "OFF")).upper()
 
-            current_ts_iso = ts_to_iso(timestamp)
+            prev_state = self.asset_state
+            event_type = None
+            message = ""
 
-            print("PARSED TIMESTAMP:", current_ts_iso)
-            print("SPEED_MPH:", speed_mph)
-            print("LATITUDE:", latitude)
-            print("LONGITUDE:", longitude)
-            print("CURRENT_ODOMETER:", current_odometer)
-            print("ENGINE_STATUS:", engine_status)
-            print("CURRENT ASSET STATE:", self.state["asset_state"])
-
-            # Duplicate timestamp bo'lsa ham log chiqadi
-            if self.state["last_processed_timestamp"] == current_ts_iso:
-                print("[SKIP] DUPLICATE TIMESTAMP. EVENT YARATILMADI.")
-                print("LAST PROCESSED:", self.state["last_processed_timestamp"])
-                return []
-
-            self.state["last_processed_timestamp"] = current_ts_iso
-            created_events = []
-
-            # ===================== MOVING START LOGIC =====================
-            if speed_mph > SPEED_THRESHOLD_MPH:
-                print(f"[CHECK] SPEED > THRESHOLD ({speed_mph} > {SPEED_THRESHOLD_MPH})")
-
-                if self.state["move_candidate_start_time"] is None:
-                    self.state["move_candidate_start_time"] = timestamp
-                    self.state["move_candidate_latitude"] = latitude
-                    self.state["move_candidate_longitude"] = longitude
-                    self.state["move_candidate_odometer"] = current_odometer
-                    print("[MOVE CANDIDATE] STARTED AT:", ts_to_iso(timestamp))
+            is_moving = speed_mph > SPEED_THRESHOLD_MPH
+            is_engine_on = engine_status == "ON"
+            if is_moving:
+                if prev_state != "MOVING":
+                    event_type = "START_MOVING"
+                    self.asset_state = "MOVING"
+                    message = "Vehicle started moving"
                 else:
-                    print("[MOVE CANDIDATE] ALREADY ACTIVE FROM:",
-                          ts_to_iso(self.state["move_candidate_start_time"]))
+                    event_type = "MOVING"
+                    self.asset_state = "MOVING"
+                    message = "Vehicle is moving"
 
-                duration_above = (timestamp - self.state["move_candidate_start_time"]).total_seconds()
-                print("[MOVE CANDIDATE] DURATION ABOVE THRESHOLD:", duration_above)
-                print("[MOVE CANDIDATE] REQUIRED:",
-                      self.state["settings"]["movement_validation_duration"])
+                self.idle_start_time = None
+            else:
+                if is_engine_on:
+                    if self.idle_start_time is None:
+                        self.idle_start_time = timestamp
 
-                if (
-                    self.state["asset_state"] == "STATIONARY"
-                    and duration_above >= self.state["settings"]["movement_validation_duration"]
-                ):
-                    event = {
-                        "event_type": "START_MOVING",
-                        "timestamp": ts_to_iso(self.state["move_candidate_start_time"]),
-                        "location": {
-                            "latitude": self.state["move_candidate_latitude"],
-                            "longitude": self.state["move_candidate_longitude"],
-                        },
-                        "current_odometer": self.state["move_candidate_odometer"],
-                    }
-                    self.add_event(event)
-                    created_events.append(event)
-
-                    print("[EVENT CREATED] START_MOVING")
-                    print(event)
-
-                    self.state["asset_state"] = "MOVING"
-                    self.state["trip_start_time"] = self.state["move_candidate_start_time"]
-                    self.state["trip_start_latitude"] = self.state["move_candidate_latitude"]
-                    self.state["trip_start_longitude"] = self.state["move_candidate_longitude"]
-                    self.state["trip_start_odometer"] = self.state["move_candidate_odometer"]
-
-                    self.state["stop_candidate_start_time"] = None
-                    self.state["stop_candidate_latitude"] = None
-                    self.state["stop_candidate_longitude"] = None
-                    self.state["stop_candidate_odometer"] = None
-
-                    self.state["idle_candidate_start_time"] = None
-                    self.state["idle_candidate_latitude"] = None
-                    self.state["idle_candidate_longitude"] = None
-                    self.state["idle_active"] = False
-
-                    print("[STATE CHANGED] asset_state = MOVING")
-                else:
-                    if self.state["asset_state"] != "STATIONARY":
-                        print("[START_MOVING SKIPPED] asset_state STATIONARY emas.")
+                    idle_seconds = (timestamp - self.idle_start_time).total_seconds()
+                    if idle_seconds >= IDLE_TIME_LIMIT:
+                        event_type = "ENGINE_IDLE"
+                        self.asset_state = "ENGINE_IDLE"
+                        message = f"Engine idle for {int(idle_seconds)} seconds"
                     else:
-                        print("[START_MOVING WAIT] duration hali yetmadi.")
-            else:
-                print(f"[CHECK] SPEED <= THRESHOLD ({speed_mph} <= {SPEED_THRESHOLD_MPH})")
-                if self.state["move_candidate_start_time"] is not None:
-                    print("[MOVE CANDIDATE RESET] speed past bo'ldi.")
-                self.state["move_candidate_start_time"] = None
-                self.state["move_candidate_latitude"] = None
-                self.state["move_candidate_longitude"] = None
-                self.state["move_candidate_odometer"] = None
-
-            # ===================== STOP MOVING LOGIC =====================
-            if self.state["asset_state"] == "MOVING":
-                print("[STOP CHECK] CURRENT STATE = MOVING")
-
-                if speed_mph < SPEED_THRESHOLD_MPH:
-                    print(f"[STOP CHECK] SPEED < THRESHOLD ({speed_mph} < {SPEED_THRESHOLD_MPH})")
-
-                    if self.state["stop_candidate_start_time"] is None:
-                        self.state["stop_candidate_start_time"] = timestamp
-                        self.state["stop_candidate_latitude"] = latitude
-                        self.state["stop_candidate_longitude"] = longitude
-                        self.state["stop_candidate_odometer"] = current_odometer
-                        print("[STOP CANDIDATE] STARTED AT:", ts_to_iso(timestamp))
-                    else:
-                        print("[STOP CANDIDATE] ALREADY ACTIVE FROM:",
-                              ts_to_iso(self.state["stop_candidate_start_time"]))
-
-                    below_duration = (timestamp - self.state["stop_candidate_start_time"]).total_seconds()
-                    print("[STOP CANDIDATE] DURATION BELOW THRESHOLD:", below_duration)
-                    print("[STOP CANDIDATE] REQUIRED:",
-                          self.state["settings"]["stop_duration_threshold"])
-
-                    if below_duration >= self.state["settings"]["stop_duration_threshold"]:
-                        stop_time = self.state["stop_candidate_start_time"]
-
-                        if self.state["trip_start_time"]:
-                            trip_duration = int((stop_time - self.state["trip_start_time"]).total_seconds())
-                            trip_duration = max(trip_duration, 0)
-                        else:
-                            trip_duration = 0
-
-                        trip_distance = self.calculate_trip_distance(
-                            stop_odometer=current_odometer,
-                            stop_latitude=latitude,
-                            stop_longitude=longitude,
-                        )
-
-                        event = {
-                            "event_type": "STOP_MOVING",
-                            "timestamp": ts_to_iso(stop_time),
-                            "duration": trip_duration,
-                            "final_location": {
-                                "latitude": latitude,
-                                "longitude": longitude,
-                            },
-                            "trip_distance": trip_distance,
-                        }
-                        self.add_event(event)
-                        created_events.append(event)
-
-                        print("[EVENT CREATED] STOP_MOVING")
-                        print(event)
-
-                        self.state["asset_state"] = "STATIONARY"
-
-                        self.state["trip_start_time"] = None
-                        self.state["trip_start_latitude"] = None
-                        self.state["trip_start_longitude"] = None
-                        self.state["trip_start_odometer"] = None
-
-                        self.state["stop_candidate_start_time"] = None
-                        self.state["stop_candidate_latitude"] = None
-                        self.state["stop_candidate_longitude"] = None
-                        self.state["stop_candidate_odometer"] = None
-
-                        print("[STATE CHANGED] asset_state = STATIONARY")
-                    else:
-                        print("[STOP_MOVING WAIT] duration hali yetmadi.")
+                        event_type = "STOPPED"
+                        self.asset_state = "STOPPED"
+                        message = f"Vehicle stopped, idle timer running ({int(idle_seconds)} sec)"
                 else:
-                    if self.state["stop_candidate_start_time"] is not None:
-                        print("[STOP CANDIDATE RESET] speed yana oshdi.")
-                    self.state["stop_candidate_start_time"] = None
-                    self.state["stop_candidate_latitude"] = None
-                    self.state["stop_candidate_longitude"] = None
-                    self.state["stop_candidate_odometer"] = None
-            else:
-                print("[STOP CHECK] SKIPPED, CHUNKI STATE MOVING EMAS")
-
-            # ===================== IDLE LOGIC =====================
-            idle_condition = engine_status == "ON" and speed_mph < SPEED_THRESHOLD_MPH
-            print("[IDLE CHECK] engine_status == ON and speed < threshold =>", idle_condition)
-
-            if idle_condition:
-                if self.state["idle_candidate_start_time"] is None:
-                    self.state["idle_candidate_start_time"] = timestamp
-                    self.state["idle_candidate_latitude"] = latitude
-                    self.state["idle_candidate_longitude"] = longitude
-                    self.state["idle_active"] = False
-                    print("[IDLE CANDIDATE] STARTED AT:", ts_to_iso(timestamp))
-                else:
-                    idle_duration = (timestamp - self.state["idle_candidate_start_time"]).total_seconds()
-                    print("[IDLE CANDIDATE] DURATION:", idle_duration)
-                    print("[IDLE CANDIDATE] REQUIRED:",
-                          self.state["settings"]["idle_time_limit"])
-                    if idle_duration >= self.state["settings"]["idle_time_limit"]:
-                        self.state["idle_active"] = True
-                        print("[IDLE ACTIVE] TRUE")
-            else:
-                if self.state["idle_candidate_start_time"] is not None and self.state["idle_active"]:
-                    idle_total = int((timestamp - self.state["idle_candidate_start_time"]).total_seconds())
-                    idle_total = max(idle_total, 0)
-
-                    event = {
-                        "event_type": "ENGINE_IDLE",
-                        "idle_start_timestamp": ts_to_iso(self.state["idle_candidate_start_time"]),
-                        "duration": idle_total,
-                        "location": {
-                            "latitude": self.state["last_latitude"],
-                            "longitude": self.state["last_longitude"],
-                        },
-                    }
-                    self.add_event(event)
-                    created_events.append(event)
-
-                    self.state["total_idle_seconds"] += idle_total
-
-                    print("[EVENT CREATED] ENGINE_IDLE")
-                    print(event)
-                    print("[TOTAL IDLE SECONDS]:", self.state["total_idle_seconds"])
-                else:
-                    print("[IDLE RESET] idle event yaratilgani yo'q.")
-
-                self.state["idle_candidate_start_time"] = None
-                self.state["idle_candidate_latitude"] = None
-                self.state["idle_candidate_longitude"] = None
-                self.state["idle_active"] = False
-
-            self.state["last_timestamp"] = timestamp
-            self.state["last_speed_mph"] = speed_mph
-            self.state["last_latitude"] = latitude
-            self.state["last_longitude"] = longitude
-            self.state["last_odometer"] = current_odometer
-            self.state["last_engine_status"] = engine_status
-
-            print("[LAST SAMPLE UPDATED]")
-            print({
-                "timestamp": ts_to_iso(self.state["last_timestamp"]),
-                "speed_mph": self.state["last_speed_mph"],
-                "latitude": self.state["last_latitude"],
-                "longitude": self.state["last_longitude"],
-                "current_odometer": self.state["last_odometer"],
-                "engine_status": self.state["last_engine_status"],
-            })
-
-            if created_events:
-                print("[RESULT] EVENTS CREATED COUNT:", len(created_events))
-                for ev in created_events:
-                    print(" ->", ev)
-            else:
-                print("[RESULT] NO EVENT CREATED")
-
-            print("[FINAL STATE]:", self.state["asset_state"])
-            print("==================================================\n")
-
-            return created_events
-
-    def get_state(self):
-        with self.lock:
-            return {
-                "asset_state": self.state["asset_state"],
-                "settings": self.state["settings"],
-                "total_idle_seconds": self.state["total_idle_seconds"],
-                "trip_start_time": ts_to_iso(self.state["trip_start_time"]),
-                "idle_candidate_start_time": ts_to_iso(self.state["idle_candidate_start_time"]),
-                "last_sample": {
-                    "timestamp": ts_to_iso(self.state["last_timestamp"]),
-                    "speed_mph": self.state["last_speed_mph"],
-                    "latitude": self.state["last_latitude"],
-                    "longitude": self.state["last_longitude"],
-                    "current_odometer": self.state["last_odometer"],
-                    "engine_status": self.state["last_engine_status"],
-                }
+                    self.idle_start_time = None
+                    event_type = "STOPPED"
+                    self.asset_state = "STOPPED"
+                    message = "Vehicle stopped and engine off"
+            event = {
+                "event_type": event_type,
+                "timestamp": ts_to_iso(timestamp),
+                "speed_mph": round(speed_mph, 2),
+                "engine_status": engine_status,
+                "lat": lat,
+                "lon": lon,
+                "current_odometer": current_odometer,
+                "state": self.asset_state,
+                "message": message
             }
 
-    def get_events(self, limit=100):
-        with self.lock:
-            return self.events[-limit:]
+            if prev_state == "MOVING" and self.asset_state != "MOVING" and event_type == "STOPPED":
+                event["event_type"] = "STOPPED"
+                event["message"] = "Vehicle stopped moving"
 
-    def reset(self):
-        with self.lock:
-            current_settings = self.state["settings"].copy()
-            self.events = []
+            self.last_event = event
+            self.last_data = item
 
-            self.state = {
-                "asset_state": "STATIONARY",
-                "settings": current_settings,
+            print("\n================ CURRENT EVENT ================")
+            print("timestamp      :", event["timestamp"])
+            print("event_type     :", event["event_type"])
+            print("state          :", event["state"])
+            print("speed_mph      :", event["speed_mph"])
+            print("engine_status  :", event["engine_status"])
+            print("lat            :", event["lat"])
+            print("lon            :", event["lon"])
+            print("current_odometer:", event["current_odometer"])
+            print("message        :", event["message"])
+            print("==============================================\n")
 
-                "last_timestamp": None,
-                "last_speed_mph": 0.0,
-                "last_latitude": None,
-                "last_longitude": None,
-                "last_odometer": None,
-                "last_engine_status": "OFF",
-
-                "last_processed_timestamp": None,
-
-                "move_candidate_start_time": None,
-                "move_candidate_latitude": None,
-                "move_candidate_longitude": None,
-                "move_candidate_odometer": None,
-
-                "stop_candidate_start_time": None,
-                "stop_candidate_latitude": None,
-                "stop_candidate_longitude": None,
-                "stop_candidate_odometer": None,
-
-                "trip_start_time": None,
-                "trip_start_latitude": None,
-                "trip_start_longitude": None,
-                "trip_start_odometer": None,
-
-                "idle_candidate_start_time": None,
-                "idle_candidate_latitude": None,
-                "idle_candidate_longitude": None,
-                "idle_active": False,
-
-                "total_idle_seconds": 0
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {get_valid_token()}"
             }
 
-            print("[RESET] Processor state reset successfully")
+            body = {
+                "globalEventId": f"GL-EVENT-{uuid.uuid4()}",
+                "event": event["event_type"],
+                "deviceDateTime": event["timestamp"],
+                "latitude": event["lat"],
+                "longitude": event["lon"],
+                "state": "AR",
+                "location": "Arzon State",
+                "direction": "NW",
+                "fuelLevelPercent": 12,
+                "defLevelPercent": 12,
+                "speed": event["speed_mph"]
+            }
 
+            requests.post("https://dev-gw.tracksafe365.com/services/glssafety/api/truck-events/send", headers=headers, json=body, timeout=5)
 
-processor = SingleTruckProcessor()
+            return event
 
+    def get_current_event(self):
+        with self.lock:
+            return self.last_event
 
-def poll_source_api_forever():
+detector = SimpleEventDetector()
+
+def poll_forever():
     while True:
         try:
-            print("\n#################### POLL START ####################")
-            print("POLL TIME:", ts_to_iso(utc_now()))
-
-            item = fetch_source_can_data()
-
-            print("FETCHED DATA:", item)
+            item = fetch_combined_data()
+            print("RAW DATA:", item)
 
             if item:
-                created_events = processor.process_item(item)
-
-                print("[POLL RESULT] EVENT COUNT:", len(created_events))
-                if created_events:
-                    for idx, event in enumerate(created_events, start=1):
-                        print(f"[POLL EVENT {idx}] {event}")
-                else:
-                    print("[POLL RESULT] EVENT LIST BO'SH")
-
-                processor.last_poll_status = {
-                    "success": True,
-                    "last_poll_time": ts_to_iso(utc_now()),
-                    "last_error": None,
-                    "item_received": True,
-                    "events_created_count": len(created_events),
-                }
+                detector.process(item)
             else:
-                print("[POLL RESULT] SOURCE DAN DATA KELMADI")
-                processor.last_poll_status = {
-                    "success": True,
-                    "last_poll_time": ts_to_iso(utc_now()),
-                    "last_error": None,
-                    "item_received": False,
-                    "events_created_count": 0,
-                }
-
-            print("LAST POLL STATUS:", processor.last_poll_status)
-            print("#################### POLL END ######################\n")
+                print("RAW DATA: None")
 
         except Exception as e:
-            print("[POLL ERROR]", str(e))
-            processor.last_poll_status = {
-                "success": False,
-                "last_poll_time": ts_to_iso(utc_now()),
-                "last_error": str(e),
-                "item_received": False,
-                "events_created_count": 0,
-            }
+            print("ERROR:", str(e))
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
-
-@app.route("/api/health", methods=["GET"])
-def health():
+@app.route("/api/current-event", methods=["GET"])
+def current_event():
     return jsonify({
         "success": True,
-        "service": "single-truck-movement-idle-detector",
-        "poll_interval_seconds": POLL_INTERVAL_SECONDS
+        "current_event": detector.get_current_event()
     }), 200
-
-
-@app.route("/api/poll-status", methods=["GET"])
-def poll_status():
-    return jsonify({
-        "success": True,
-        "poll_status": processor.last_poll_status
-    }), 200
-
-
-@app.route("/api/state", methods=["GET"])
-def state():
-    return jsonify({
-        "success": True,
-        "state": processor.get_state()
-    }), 200
-
-
-@app.route("/api/events", methods=["GET"])
-def events():
-    limit = int(request.args.get("limit", 100))
-    return jsonify({
-        "success": True,
-        "events": processor.get_events(limit=limit)
-    }), 200
-
-
-@app.route("/api/process-now", methods=["POST"])
-def process_now():
-    try:
-        print("[MANUAL PROCESS] /api/process-now called")
-        item = fetch_source_can_data()
-
-        if not item:
-            print("[MANUAL PROCESS] No data received from source API")
-            return jsonify({
-                "success": True,
-                "message": "No data received from source API",
-                "events_created_count": 0,
-                "events_created": []
-            }), 200
-
-        created_events = processor.process_item(item)
-
-        return jsonify({
-            "success": True,
-            "events_created_count": len(created_events),
-            "events_created": created_events
-        }), 200
-    except Exception as e:
-        print("[MANUAL PROCESS ERROR]", str(e))
-        return jsonify({
-            "success": False,
-            "message": str(e)
-        }), 500
-
-
-@app.route("/api/reset", methods=["POST"])
-def reset():
-    processor.reset()
-    return jsonify({
-        "success": True,
-        "message": "Processor state reset successfully"
-    }), 200
-
 
 if __name__ == "__main__":
-    print("[SERVICE STARTING] single-truck-movement-idle-detector")
-    print("SOURCE_CAN_API_URL:", SOURCE_CAN_API_URL)
-    print("GPS_API_URL:", GPS_API_URL)
-    print("POLL_INTERVAL_SECONDS:", POLL_INTERVAL_SECONDS)
-    print("SPEED_THRESHOLD_MPH:", SPEED_THRESHOLD_MPH)
-    print("DEFAULT_SETTINGS:", DEFAULT_SETTINGS)
-    print("FLASK PORT: 2222")
+    print("Service starting...")
+    print("Telemetry API:", SOURCE_CAN_API_URL)
+    print("GPS API:", GPS_API_URL)
+    print("Poll interval:", POLL_INTERVAL_SECONDS)
+    print("Speed threshold:", SPEED_THRESHOLD_MPH)
+    print("Idle limit:", IDLE_TIME_LIMIT)
 
-    poller_thread = Thread(target=poll_source_api_forever, daemon=True)
-    poller_thread.start()
+    poll_thread = Thread(target=poll_forever, daemon=True)
+    poll_thread.start()
 
-    app.run(host="0.0.0.0", port=2222, debug=False)
+    app.run(port=2222)
