@@ -121,7 +121,7 @@ class SimpleEventDetector:
     def process(self, item):
         with self.lock:
             timestamp = parse_ts(item.get("timestamp"))
-            speed_mph = safe_float(item.get("speed_mph"), 0.0)
+            speed_mph = safe_float(item.get("wheel_based_speed"), 0.0)
             lat = item.get("lat")
             lon = item.get("lon")
             current_odometer = item.get("total_distance")
